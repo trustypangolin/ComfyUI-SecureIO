@@ -42,6 +42,21 @@ def _parse_restore(extra_metadata):
     return value if isinstance(value, dict) else {"value": value}
 
 
+def _restore(extra_metadata, original, original_sha256, require_original, label):
+    """The sealed 'restore' dict. With original/original_sha256 wired (as DockerCPU's SaveImageWithFilename
+    does) it also carries schema 1 + provenance, so LoadEncryptedImageWithMetadata can read ORIGINAL back."""
+    restore = _parse_restore(extra_metadata)
+    if original is not None or original_sha256 is not None or require_original:
+        restore["schema"] = 1
+        restore["original"] = (original or "").strip() or None
+        restore["original_sha256"] = (original_sha256 or "").strip() or None
+        if require_original and not (restore["original"] and restore["original_sha256"]):
+            raise ValueError(f"restore provenance: no library original for {restore.get('source') or label}; "
+                             "run tools/resolve_original.py")
+    restore["encrypted"] = True
+    return restore
+
+
 def _names(stem, suffix, ext, count):
     stem = clean_name_part(stem, "stem").strip()
     if not stem:
@@ -76,7 +91,18 @@ COMMON_INPUTS = {
 OPTIONAL_INPUTS = {
     "suffix": ("STRING", {"default": "", "tooltip": "Appended to the stem, e.g. _p01_head."}),
     "extra_metadata": ("STRING", {"default": "", "multiline": True, "tooltip": "JSON stored (encrypted) as the 'restore' metadata."}),
+    "original": ("STRING", {"forceInput": True, "tooltip": "ORIGINAL from the loader; sealed into 'restore' (null when empty)."}),
+    "original_sha256": ("STRING", {"forceInput": True, "tooltip": "ORIGINAL_SHA256 from the loader; sealed into 'restore' (null when empty)."}),
+    "require_original": ("BOOLEAN", {"default": False, "tooltip": "Raise and save nothing when original or original_sha256 is empty."}),
+    "recovery_recipient": ("STRING", {"forceInput": True, "tooltip": "Optional second X25519 public key (base64), e.g. the recovery key: the file is then CEIO v2 and either key opens it."}),
 }
+
+
+def _recipients(recipient, recovery_recipient):
+    """(primary public key, extra public keys). An empty/unwired recovery_recipient keeps the file v1."""
+    pub = ceio.parse_public(recipient)
+    extra = (ceio.parse_public(recovery_recipient),) if recovery_recipient and recovery_recipient.strip() else ()
+    return pub, extra
 
 
 class SaveEncryptedImageWithFilename:
@@ -93,9 +119,11 @@ class SaveEncryptedImageWithFilename:
     DESCRIPTION = "Saves images as output/<stage>/<mirror_dir>/<stem><suffix>.png.ceio, encrypted to `recipient`. No previews."
 
     def save(self, images, recipient, stage, mirror_dir, stem, if_exists="error", embed_workflow=True,
-             suffix="", extra_metadata="", prompt=None, extra_pnginfo=None):
-        pub = ceio.parse_public(recipient)
-        restore = {**_parse_restore(extra_metadata), "encrypted": True}
+             suffix="", extra_metadata="", original=None, original_sha256=None, require_original=False,
+             recovery_recipient=None, prompt=None, extra_pnginfo=None):
+        pub, extra = _recipients(recipient, recovery_recipient)
+        restore = _restore(extra_metadata, original, original_sha256, require_original,
+                           "/".join(p for p in (mirror_dir.strip(), stem + suffix) if p))
         names = _names(stem, suffix, "png", len(images))
         paths = [stage_output_path(stage, mirror_dir, n + ".ceio") for n in names]
         _check_targets(paths, if_exists)
@@ -115,7 +143,7 @@ class SaveEncryptedImageWithFilename:
             Image.fromarray(arr).save(buf, format="PNG", pnginfo=info, compress_level=4)
             meta = {"name": name, "mime": "image/png", "width": int(arr.shape[1]), "height": int(arr.shape[0]),
                     "restore": restore}
-            write_atomic(path, ceio.seal(buf.getvalue(), meta, pub), if_exists)
+            write_atomic(path, ceio.seal(buf.getvalue(), meta, pub, extra_recipients=extra), if_exists)
             buf.close()
             ui.append(_ui_entry(path))
         return {"ui": {"ceio": ui}, "result": ("\n".join(paths),)}
@@ -135,11 +163,13 @@ class SaveEncryptedVideoWithFilename:
     DESCRIPTION = "Saves a video as output/<stage>/<mirror_dir>/<stem><suffix>.mp4.ceio (H.264), encrypted to `recipient`."
 
     def save(self, video, recipient, stage, mirror_dir, stem, if_exists="error", embed_workflow=True,
-             suffix="", extra_metadata="", prompt=None, extra_pnginfo=None):
+             suffix="", extra_metadata="", original=None, original_sha256=None, require_original=False,
+             recovery_recipient=None, prompt=None, extra_pnginfo=None):
         from comfy_api.latest import Types
 
-        pub = ceio.parse_public(recipient)
-        restore = {**_parse_restore(extra_metadata), "encrypted": True}
+        pub, extra = _recipients(recipient, recovery_recipient)
+        restore = _restore(extra_metadata, original, original_sha256, require_original,
+                           "/".join(p for p in (mirror_dir.strip(), stem + suffix) if p))
         (name,) = _names(stem, suffix, "mp4", 1)
         path = stage_output_path(stage, mirror_dir, name + ".ceio")
         _check_targets([path], if_exists)
@@ -155,7 +185,8 @@ class SaveEncryptedVideoWithFilename:
         video.save_to(buf, format=Types.VideoContainer.MP4, codec=Types.VideoCodec.H264, metadata=metadata)
         w, h = video.get_dimensions()
         meta = {"name": name, "mime": "video/mp4", "width": int(w), "height": int(h), "restore": restore}
-        write_atomic(path, ceio.seal(buf.getvalue(), meta, pub, flags=ceio.FLAG_VIDEO), if_exists)
+        write_atomic(path, ceio.seal(buf.getvalue(), meta, pub, flags=ceio.FLAG_VIDEO, extra_recipients=extra),
+                     if_exists)
         buf.close()
         return {"ui": {"ceio": [_ui_entry(path)]}, "result": (path,)}
 
